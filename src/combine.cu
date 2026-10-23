@@ -268,7 +268,45 @@ __global__ void mapKernel(
   // 5. Calculate the position of element in out_array according to out_index and out_strides
   // 6. Apply the unary function to the input element and write the output to the out memory
 
-  assert(false && "Not Implemented");
+  // Definition:
+  // - CUDA kernel: a function that runs on the GPU
+  // - hierarchy:
+  //   - Grid: a grid is all blocks launched for one kernel call
+  //   - Block: a block is a group of threads
+  //   - Thread: a thread is the thing that does actual work (in sequential order)
+  //
+  // The below variables are predefined in a kernel function:
+  // - blockIdx: the index of the block inside the grid
+  // - blockDim: the number of threads inside a block
+  // - threadIdx: the index of the thread inside a block
+
+  int out_pos = blockIdx.x * blockDim.x + threadIdx.x; // global thread ID, ex: 7
+  if (out_pos >= out_size) {
+    return;
+  }
+
+  // ex: out_shape = [2, 2, 3]
+  // from out_pos = 7, we get out_index = [1, 0, 1]
+  to_index(out_pos, out_shape, out_index, shape_size);
+
+  // ex: out_shape = [2, 2, 3], in_shape = [1, 3]
+  // Broadcasting rule for two tensors `x` & `y`:
+  // 1. align from the right
+  // 2. if number of dimensions are not equal, then prepend 1 to the tensor with fewer dimensions to make them equal
+  // 3. then, for each dimension size, the resulting dimension size is max(x, y) along that dimension (note: one of them must be 1)
+  // => out_shape = [2, 2, 3]
+  //    in_shape  = [1, 1, 3]
+  broadcast_index(out_index, out_shape, in_shape, in_index, shape_size, shape_size);
+
+  // ex: 
+  // in_index = [0, 2]
+  // in_strides = [3, 1]
+  // => in_pos = 0*3 + 2*1 = 2
+  int in_pos = index_to_position(in_index, in_strides, shape_size);
+  int out_storage_pos = index_to_position(out_index, out_strides, shape_size);
+
+  out[out_storage_pos] = fn(fn_id, in_storage[in_pos]);
+
   /// END HW1_1
 }
 
@@ -334,7 +372,24 @@ __global__ void zipKernel(
   // 7.Calculate the position of element in b_array according to b_index and b_strides
   // 8. Apply the binary function to the input elements in a_array & b_array and write the output to the out memory
 
-  assert(false && "Not Implemented");
+  int out_pos = blockIdx.x * blockDim.x + threadIdx.x;
+  if (out_pos >= out_size) {
+    return;
+  }
+
+  to_index(out_pos, out_shape, out_index, out_shape_size);
+
+  int out_storage_pos = index_to_position(out_index, out_strides, out_shape_size);
+
+  // out_index -> find corresponding input_index (a & b) under broadcasting
+  broadcast_index(out_index, out_shape, a_shape, a_index, out_shape_size, a_shape_size);
+  int a_pos = index_to_position(a_index, a_strides, a_shape_size);
+
+  broadcast_index(out_index, out_shape, b_shape, b_index, out_shape_size, b_shape_size);
+  int b_pos = index_to_position(b_index, b_strides, b_shape_size);
+
+  out[out_storage_pos] = fn(fn_id, a_storage[a_pos], b_storage[b_pos]);
+  
   /// END HW1_2
 }
 
@@ -379,8 +434,11 @@ __global__ void reduceKernel(
    *  None (Fills in out array)
    */
 
-  // __shared__ double cache[BLOCK_DIM]; // Uncomment this line if you want to use shared memory to store partial results
+  // Shared memory is a memory space that can be accessed by all threads in a thread block.
+  // It is located on each SM.
+  __shared__ float cache[BLOCK_DIM]; // Uncomment this line if you want to use shared memory to store partial results
   int out_index[MAX_DIMS];
+  int a_index[MAX_DIMS];
 
   /// BEGIN HW1_3
   /// TODO
@@ -390,19 +448,114 @@ __global__ void reduceKernel(
   // 4. Iterate over the reduce_dim dimension of the input array to compute the reduced value
   // 5. Write the reduced value to out memory
 
-  assert(false && "Not Implemented");
+  // ===== Basic version =====
+  // 1 thread is responsible for 1 output in the output tensor
+  //
+  // int out_pos = blockIdx.x * blockDim.x + threadIdx.x; // global thread ID, ex: 7
+  // if (out_pos >= out_size) {
+  //   return;
+  // }
+
+  // to_index(out_pos, out_shape, out_index, shape_size);
+  
+  // int out_storage_pos = index_to_position(out_index, out_strides, shape_size);
+
+  // float result = reduce_value;
+  // for (int i = 0; i < a_shape[reduce_dim]; i++) {
+  //   out_index[reduce_dim] = i;
+
+  //   int a_pos = index_to_position(out_index, a_strides, shape_size);
+
+  //   result = fn(fn_id, result, a_storage[a_pos]);
+  // }
+
+  // out[out_storage_pos] = result;
+
+  // ===== Optimized version =====
+  //  1 block is responsible for 1 output in the output tensor
+  // ex: input_tensor's shape = [2, 3, 4]
+  // suppose a block has 4 threads. For output position [0, 1, 0], block1 will do
+  // - thread0 loads a[0, 1, 0] into shared memory
+  // - thread1 loads a[0, 1, 1] ...
+  // - thread2 loads a[0, 1, 2] ...
+  // - thread3 loads a[0, 1, 3] ...
+  // so now cache is [v0, v1, v2, v3].
+  // Next, reduce in parallel
+  // round1: thread0 combines v0 + v1; thread2 combines v2 + v3 => cache = [v0+v1, _, v2+v3, _]
+  // round2: thread0 combines v0+v1 + v2+v3 => cache[0] = total
+
+  int out_pos = blockIdx.x;
+  int tid = threadIdx.x; // the index of the element inside the reduction
+  if (out_pos >= out_size) {
+    return;
+  }
+
+  to_index(out_pos, out_shape, out_index, shape_size); // the index of the output element this block is computing
+
+  // start from this output index
+  for (int d = 0; d < shape_size; d++) {
+    a_index[d] = out_index[d];
+  }
+
+  // the kernel is launched with threadsPerBlock = 32.
+  // However, the # of elements along reduce_dim may be > 32.
+  // Thus, we need to add a preprocessing step where each thread sums up a[, , start_idx], a[, , start_idx + threadsPerBlock], ... and store it in a[, , 0].
+  // ex: thread0 sums a[, , 0], a[, , 32], a[, , 64] and store the sum in a[, , 0]
+  //     thread1 sums a[, , 1], a[, , 33], a[, , 65] and store the sum in a[, , 1]
+  // Now, we preprocess the array as if it had <= 32 elements along reduce_dim
+  int reduce_size = a_shape[reduce_dim]; // # of elements along reduce_dim
+  int tree_size = min(reduce_size, (int)blockDim.x); // # of elements along reduce_dim after the preprocessing
+  // let each thread handle one element in preprocessed array
+  if (tid < tree_size) {
+    a_index[reduce_dim] = tid;
+    int a_pos = index_to_position(a_index, a_strides, shape_size);
+    float local = a_storage[a_pos]; // ex: a[, , 0]
+    for (int i = tid + blockDim.x; i < reduce_size; i += blockDim.x) {
+      a_index[reduce_dim] = i;
+      a_pos = index_to_position(a_index, a_strides, shape_size);
+      local = fn(fn_id, local, a_storage[a_pos]);
+    }
+
+    cache[tid] = local;
+  }
+
+  // need to wait for all threads to finish, bcuz we want to ensure
+  // all the elements along preprocessed reduce_dim to be loaded into the shared memory
+  __syncthreads();
+
+  // tree reduction
+  // the thread IDs that will do the work in each round is
+  // round1: t0, t2, t4, ...
+  // round2: t0, t4, t8, ...
+  // in total there is log2(reduce_size) rounds
+  for (int offset = 1; offset < tree_size; offset *= 2) {
+    if (tid % (2 * offset) == 0 && tid + offset < tree_size) {
+      // thread IDs that do the work in the current round
+      cache[tid] = fn(fn_id, cache[tid], cache[tid + offset]);
+    }
+
+    __syncthreads(); // wait for all threads in the current round to finish
+  }
+
+  // first thread writes the final result
+  if (tid == 0) {
+    int out_storage_pos = index_to_position(out_index, out_strides, shape_size);
+    out[out_storage_pos] = fn(fn_id, reduce_value, cache[0]); // final reduce with the initial reduce value
+  }
+
+
   /// END HW1_3
 }
 
 __global__ void MatrixMultiplyKernel(
     float *out,
-    const int *out_shape,
+    const int *out_shape, // [batch_size, m, p]
     const int *out_strides,
-    float *a_storage,
-    const int *a_shape,
+    float *a_storage, 
+    const int *a_shape, // [batch_size, m, n]
     const int *a_strides,
     float *b_storage,
-    const int *b_shape,
+    const int *b_shape, // [batch_size, n, p]
     const int *b_strides)
 {
   /**
@@ -450,7 +603,74 @@ __global__ void MatrixMultiplyKernel(
   // 6. Synchronize to make sure all threads are done computing the output tile for (row, col)
   // 7. Write the output to global memory
 
-  assert(false && "Not Implemented");
+  // ===== basic version =====
+  // int row = blockIdx.x * blockDim.x + threadIdx.x;
+  // int col = blockIdx.y * blockDim.y + threadIdx.y;
+
+  // float sum = 0.0;
+  // if (row < out_shape[1] && col < out_shape[2]) {
+  //   for (int k = 0; k < a_shape[2]; k++) {
+  //     // ex: a_shape = [2, 3, 5] => a_strides = [15, 5, 1]
+  //     // if the curr index is (batch, row, k) = (1, 2, 3),
+  //     // then a_pos is 1*15 + 2*5 + 3*1.
+  //     // same as `index_to_position()`, but just written out manually
+  //     int a_pos = batch * a_batch_stride + row * a_strides[1] + k * a_strides[2];
+  //     int b_pos = batch * b_batch_stride + k * b_strides[1] + col * b_strides[2];
+
+  //     sum += a_storage[a_pos] * b_storage[b_pos];
+  //   }
+
+  //   int out_pos = batch * out_strides[0] + row * out_strides[1] + col * out_strides[2];
+  //   out[out_pos] = sum;
+  // }
+
+  // ===== optimized version (Tiling)=====
+  // (this assumes block size and tile size are the same, both are 32x32)
+  // Here,
+  // - block size is the number/layout of threads in the CUDA block
+  // - tile size is the number/layout of output elements that block computes
+  
+  // the position of the output element in the output array that this thread should compute
+  int row = blockIdx.x * TILE + threadIdx.x;
+  int col = blockIdx.y * TILE + threadIdx.y;
+
+  float p_value = 0;
+  for (int phase = 0; phase < (a_shape[2] + TILE - 1) / TILE; phase++) {
+    // Load the corresponding block of A and B into shared memory
+
+    // fill in default value first
+    a_shared[threadIdx.x][threadIdx.y] = 0;
+    b_shared[threadIdx.x][threadIdx.y] = 0;
+    
+    // if within boundary, then the thread should load the corresponding element from global mem to shared mem
+    if (row < a_shape[1] && (phase * TILE + threadIdx.y) < a_shape[2]) {
+      int a_pos = batch * a_batch_stride + row * a_strides[1] + (phase * TILE + threadIdx.y) * a_strides[2];
+      a_shared[threadIdx.x][threadIdx.y] = a_storage[a_pos];
+    }
+    if ((phase * TILE + threadIdx.x) < b_shape[1] && col < b_shape[2]) {
+      int b_pos = batch * b_batch_stride + (phase * TILE + threadIdx.x) * b_strides[1] + col * b_strides[2];
+      b_shared[threadIdx.x][threadIdx.y] = b_storage[b_pos];
+    }
+
+    // need to wait for all threads to load the elements from A & B into shared memory
+    __syncthreads();
+
+    // multiply the tiles from A & B for the current phase
+    for (int k = 0; k < TILE; k++) {
+      p_value += a_shared[threadIdx.x][k] * b_shared[k][threadIdx.y];
+    }
+
+    // Need to wait for all threads to finish the current phase.
+    // Otherwise, if some threads move to the next phase first, then they may overwrite
+    // the data in the shared memory that is still currently used by other threads in the current phase
+    __syncthreads();
+  }
+
+  if (row < a_shape[1] && col < b_shape[2]) {
+    int out_pos = batch * out_strides[0] + row * out_strides[1] + col * out_strides[2];
+    out[out_pos] = p_value;
+  }
+
   /// END HW1_4
 }
 
@@ -504,7 +724,8 @@ extern "C"
     // Copy back to the host
     cudaMemcpy(out, d_out, batch * m * p * sizeof(float), cudaMemcpyDeviceToHost);
 
-    cudaDeviceSynchronize();
+    // block the CPU until all previously issued GPU work on that device has finished
+    cudaDeviceSynchronize(); 
 
     // Check CUDA execution
     cudaError_t err = cudaGetLastError();
@@ -692,14 +913,57 @@ extern "C"
     cudaMemcpy(d_a_strides, a_strides, shape_size * sizeof(int), cudaMemcpyHostToDevice);
 
     // Launch kernel
-    int threadsPerBlock = 32;
+    int threadsPerBlock = 32; // can try changing to 1024
     int blocksPerGrid = (out_size + threadsPerBlock - 1) / threadsPerBlock;
-    reduceKernel<<<blocksPerGrid, threadsPerBlock>>>(
+    // ===== basic version =====:
+    // reduceKernel<<<blocksPerGrid, threadsPerBlock>>>(
+    //     d_out, d_out_shape, d_out_strides, out_size,
+    //     d_a, d_a_shape, d_a_strides,
+    //     reduce_dim, reduce_value, shape_size, fn_id);
+    //
+    // ===== optimized version =====:
+    // (add some code to measure the time it takes to call kernel)
+    // cudaEvent_t start, stop;
+    // cudaEventCreate(&start);
+    // cudaEventCreate(&stop);
+
+    // the function below queues the event into the GPU stream/queue and returns immediately.
+    // (a stream is a software-level queue to sequence GPU commands)
+    // the GPU records the timestamp only when the execution in that stream actually reaches that event.
+    // cudaEventRecord(start);
+
+    // In the optimized version, since we are using 1 block for each output element,
+    // so total # of blocks is the total number of elements in the output tensor (out_size)
+    reduceKernel<<<out_size, threadsPerBlock>>>(
         d_out, d_out_shape, d_out_strides, out_size,
         d_a, d_a_shape, d_a_strides,
         reduce_dim, reduce_value, shape_size, fn_id);
 
+    // cudaEventRecord(stop);
+
+    // kernel launches are asynchronous, which means that reduceKernel<<<...>>> returns before GPU necessarily finishes.
+    // so we need to let the CPU wait until the GPU has finish executing the kernel and reaches the `stop` marker,
+    // before the CPU can continue to calculate cudaEventElapsedTime.
+    // If CPU didn't wait, then the `stop` marker timestamp may be unknown.
+    // cudaEventSynchronize(stop);
+
+    // float milliseconds = 0.0f;
+    // cudaEventElapsedTime(&milliseconds, start, stop);
+
+    // printf("Reduce kernel time: %f ms\n", milliseconds);
+
+    // cudaEventDestroy(start);
+    // cudaEventDestroy(stop);
+
     // Copy back to the host
+    // defult cudaMemcpy() is blocking operation for the CPU.
+    // It forces the GPU to finish all previous works in all streams before the copy starts,
+    // and waits for the copy to end b4 returning control to the CPU.
+    // By default, the waiting CPU thread spins to check whether it is done or not.
+    // (with the cudaDeviceScheduleBlockingSync, the CPU thread goes to sleep and yields the core.
+    //  Once the GPU completes the operation, it will send an interrupt to the CPU. The CPU will then
+    //  receive this interrupt, goes to the OS kernel (kernel mode), and the OS will move the CPU thread
+    //  from the sleeping state back to "ready" queue so that it can be scheduled to run).
     cudaMemcpy(out, d_out, out_size * sizeof(float), cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
 
