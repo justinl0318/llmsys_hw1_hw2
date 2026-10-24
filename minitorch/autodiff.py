@@ -106,9 +106,24 @@ def topological_sort(variable: Variable) -> Iterable[Variable]:
             at the front of the result order list.
     """
     # BEGIN HW2_1
-    # TODO
+    visited = set()
+    topo_order = []
     
-    raise NotImplementedError("Task Autodiff Not Implemented Yet")
+    def dfs(v: Variable) -> None:
+        # constants don't need to be included in the topo order array
+        if v.is_constant() or v.unique_id in visited:
+            return
+        
+        visited.add(v.unique_id)
+        for parent in v.parents:
+            dfs(parent)
+            
+        topo_order.append(v)
+        
+    dfs(variable)
+    topo_order.reverse()
+    return topo_order
+        
     # END HW2_1
 
 
@@ -129,9 +144,27 @@ def backpropagate(variable: Variable, deriv: Any) -> None:
         3. Otherwise, the derivative should be propagated via chain rule
     """
     # BEGIN HW2_1
-    # TODO
-   
-    raise NotImplementedError("Task Autodiff Not Implemented Yet")
+    
+    # stores the total gradient of the final output w.r.t v
+    derivatives = {variable.unique_id: deriv}
+    for v in topological_sort(variable):
+        d = derivatives[v.unique_id]
+        
+        if v.is_leaf():
+            v.accumulate_derivative(d)
+        else:
+            for parent, parent_deriv in v.chain_rule(d):
+                if parent.is_constant():
+                    continue
+                
+                # here, parent_deriv is alr chain-rule with the incoming gradient.
+                # Ex: suppose the curr node is v, and the parent is p,
+                # then parent_deriv = dL/dv * dv/dp
+                if parent.unique_id in derivatives:
+                    derivatives[parent.unique_id] += parent_deriv
+                else:
+                    derivatives[parent.unique_id] = parent_deriv
+                
     # END HW2_1
 
 
